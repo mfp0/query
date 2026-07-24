@@ -1,0 +1,464 @@
+# Schema Mapping — Agent Task Sheet
+
+**Goal:** teach the LLM the database schema so it later knows *what* to query, *where*,
+and *what to join* to get a correct answer. You will (1) fetch the columns of a given
+list of tables, (2) infer relationships (this DB has **no FK constraints**, even though
+logical FKs exist), (3) draw an ERD, and (4) write a reusable schema knowledge file.
+
+You run everything through `dbtool.py` (see `README.md`). Output of that tool is always
+one JSON object: `{"ok": true, "columns":[...], "rows":[[...]], ...}` or
+`{"ok": false, "error":"...", ...}`.
+
+---
+
+## FOR THE HUMAN OPERATOR (read once)
+
+- The models available are small and make mistakes. **Give the model ONE PHASE at a
+  time.** Do not paste the whole file at once. Let it finish a phase, check the output
+  file, then hand it the next phase.
+- Set the input file first. This sheet assumes a text file **`tables_input.txt`** in the
+  project folder that lists the tables and their descriptions (any format — the model
+  will extract names and confirm them against the DB).
+- All commands assume the working directory is the project folder (where `dbtool.py`
+  lives) and Windows PowerShell.
+
+---
+
+## HARD RULES FOR THE MODEL (never break these)
+
+1. **Only use table and column names that appeared in real `dbtool.py` output.**
+   Never invent, guess, translate, or "fix" a name. If you did not see it in a result,
+   it does not exist.
+2. **Always run the command. Never fabricate results.** Copy the JSON you actually got.
+3. **Do ONE table (or ONE relationship) at a time.** Finish it, write it to the output
+   file, then move to the next.
+4. **If any command returns `"ok": false`, STOP.** Report the `error` and `hint`
+   verbatim. Do not continue to the next step until told.
+5. **Identifiers go directly in SQL; only data values use `--bind`.** Table and column
+   names cannot be bound — put them straight into the SQL text (they come from trusted
+   `describe` output). Bind only literal values you compare against.
+6. **Keep each reply short.** Do the current step only. Write results to files as you go;
+   do not try to hold the whole schema in your head.
+7. **Never run writes.** Everything here is `SELECT`. Never use `--allow-write`.
+
+---
+
+## OUTPUT FILES YOU WILL CREATE (in `schema/`)
+
+| File | Phase | Content |
+|------|-------|---------|
+| `schema/01_tables.md` | 1 | Confirmed table list + one-line description each |
+| `schema/02_columns.md` | 2 | One section per table: columns, types, nullable, PK, business meaning |
+| `schema/02b_business_context.md` | 2B | Per-column inferred business meaning + evidence |
+| `schema/03_relations.md` | 4 | Inferred + verified relationships with evidence |
+| `schema/04_erd.md` | 5 | Mermaid ER diagram |
+| `schema/05_knowledge.md` | 6 | Final per-table cards: purpose, keys, join recipes |
+| `schema/progress.md` | all | Checklist of what is done (so you can resume) |
+
+Create the `schema/` folder if it does not exist.
+
+---
+
+## PHASE 0 — Sanity check (do this once before anything else)
+
+**Steps**
+
+1. Run:
+   ```powershell
+   python dbtool.py ping
+   ```
+2. If the result is not `"ok": true`, STOP and report the error. Nothing else will work.
+3. From the result note **`CURRENT_USER`** (the schema you are logged into) and
+   **`SERVICE`**. Write them at the top of `schema/progress.md`:
+   ```
+   # Progress
+   Logged in as: <CURRENT_USER>   Service: <SERVICE>
+   ```
+4. Get the ground-truth list of tables/views you can actually see:
+   ```powershell
+   python dbtool.py tables --format tsv
+   ```
+   Keep this output; you will cross-check the input file against it in Phase 1.
+
+> If a table from the input file is **not** in this list, it may live in another schema.
+> See **Appendix A — Cross-schema fallback**.
+
+---
+
+## PHASE 1 — Build the confirmed table list
+
+**Goal:** turn `tables_input.txt` into a clean, verified list of table names.
+
+**Steps**
+
+1. Read `tables_input.txt`. Extract every candidate **table name** and its description.
+   Do not reformat the descriptions; just capture them.
+2. For each candidate name, confirm it exists using the Phase 0 `tables` output, or:
+   ```powershell
+   python dbtool.py tables --like "EXACT_NAME"
+   ```
+3. Write `schema/01_tables.md` using this template. Mark each row `FOUND` or `MISSING`.
+
+**Output template — `schema/01_tables.md`**
+```markdown
+# Tables
+
+| # | TABLE_NAME | STATUS | DESCRIPTION (from input file) |
+|---|-----------|--------|-------------------------------|
+| 1 | CUSTOMER  | FOUND  | Master data of customers |
+| 2 | ORDERS    | FOUND  | Sales orders header |
+| 3 | OLD_THING | MISSING| (not visible in this schema) |
+```
+
+4. In `schema/progress.md`, list every FOUND table with an empty checkbox:
+   ```
+   ## Columns fetched
+   - [ ] CUSTOMER
+   - [ ] ORDERS
+   ```
+
+**Done-check:** every input table appears exactly once in `01_tables.md` with a status.
+
+---
+
+## PHASE 2 — Fetch columns for each table
+
+**Goal:** the exact column inventory of every FOUND table.
+
+**Repeat these steps for ONE table at a time** (in the order from `01_tables.md`):
+
+1. Run:
+   ```powershell
+   python dbtool.py describe TABLE_NAME
+   ```
+   The result columns are `POS, NAME, TYPE, LENGTH, NULLABLE, PK, COMMENTS`.
+   **`COMMENTS`** is the column's business description straight from the database
+   (Oracle column comments). It may be `null` when the column has no comment.
+2. If `"ok": false`, STOP and report. If `rows` is empty, the table is not in your
+   schema → see **Appendix A**.
+3. Append a section to `schema/02_columns.md` using the template below. Copy the rows
+   exactly from the JSON. `PK = Y` marks a primary-key column. For the **BUSINESS
+   MEANING** column at this stage: if the DB `COMMENTS` value is present use it; else if
+   the column is described in `tables_input.txt` use that; **otherwise leave it as
+   `(infer in 2B)`** — you will fill it by analysis in the next phase. Do NOT invent a
+   meaning here.
+
+> In this database most columns have **no** DB comment, so `COMMENTS` is usually `null`.
+> That is expected — Phase 2B derives the business meaning from data + names + context.
+4. Tick the table in `schema/progress.md`: `- [x] TABLE_NAME`.
+5. Move to the next table. **Do not batch — one describe, one section, then next.**
+
+**Output template — one section per table in `schema/02_columns.md`**
+```markdown
+## CUSTOMER
+Primary key: CUSTOMER_ID
+Table purpose: <one line from tables_input.txt or the table comment>
+
+| POS | NAME | TYPE | LEN | NULL | PK | BUSINESS MEANING |
+|-----|------|------|-----|------|----|------------------|
+| 1 | CUSTOMER_ID | NUMBER   | 22  | N | Y | Surrogate primary key of a customer |
+| 2 | NAME        | VARCHAR2 | 100 | N | N | Full legal name of the customer |
+| 3 | CITY        | VARCHAR2 | 60  | Y | N | City of the main address |
+```
+If a table has no `PK = Y` column, write `Primary key: (none declared)`.
+
+> Optional — table-level business description (Oracle table comment). Use it for the
+> `Table purpose:` line and in Phase 6:
+> ```powershell
+> python dbtool.py query "SELECT comments FROM user_tab_comments WHERE table_name = :t" --bind t=TABLE_NAME
+> ```
+
+**Done-check:** every FOUND table has a section, and every checkbox in progress.md is
+ticked. This completes the immediate goal (columns for all tables).
+
+---
+
+## PHASE 2B — Infer the business context of each column (by analysis)
+
+**Goal:** for every column, **produce** a one-line business meaning by looking at the
+data and the context — because the database has almost no column comments. You are not
+copying a comment; you are deducing what the column *is for* from evidence. Output goes to
+`schema/02b_business_context.md` and back into the BUSINESS MEANING column of
+`02_columns.md`.
+
+**Golden rule:** every inferred meaning must be backed by evidence you actually queried.
+If you cannot gather evidence, write `UNKNOWN` — never guess blindly.
+
+**For ONE column at a time**, gather evidence, classify, then write a sentence.
+
+### Step 1 — Gather evidence (run these; TAB and COL are real names from Phase 2)
+
+1. Shape (counts, range):
+   ```powershell
+   python dbtool.py query "SELECT COUNT(*) AS total, COUNT(COL) AS non_null, COUNT(DISTINCT COL) AS distinct_vals, MIN(COL) AS min_v, MAX(COL) AS max_v FROM TAB"
+   ```
+2. Example values:
+   ```powershell
+   python dbtool.py query "SELECT DISTINCT COL FROM TAB WHERE COL IS NOT NULL" --limit 10
+   ```
+3. Only if `distinct_vals` is small (say <= 25) — the value distribution (it is a
+   category/status/flag):
+   ```powershell
+   python dbtool.py query "SELECT COL AS value, COUNT(*) AS cnt FROM TAB GROUP BY COL ORDER BY cnt DESC" --limit 25
+   ```
+
+### Step 2 — Classify the column (use the first row that matches)
+
+| If the evidence looks like… | Category | Meaning sentence template |
+|-----------------------------|----------|---------------------------|
+| PK = Y, or name ends `_ID` and `distinct_vals ≈ total` | **Identifier** | "Unique identifier of a <table subject> row." |
+| Name matches a PK of another table (a verified relation from Phase 4) | **Foreign key** | "Reference to <PARENT> (<PARENT>.<PK>); links each row to its <parent subject>." |
+| `distinct_vals` small (<= 25) and values are short codes/words | **Category / status** | "Categorical <name>; observed values: <v1, v2, v3 …>." |
+| Values are only 2 distinct like Y/N, 0/1, T/F | **Flag (boolean)** | "Yes/No flag: whether the row <meaning of name>." |
+| NUMBER and name has AMT/AMOUNT/PRICE/COST/VALUE/QTY/QUANTITY/SUM | **Measure** | "Numeric measure: <name> (range <min>..<max>)." |
+| DATE/TIMESTAMP type | **Date** | "Date/time of <event from the name, e.g. CREATED = creation>." |
+| VARCHAR2, high `distinct_vals`, longer text, name like NAME/DESC/NOTE/ADDRESS | **Free text** | "Free-text <name> (e.g. <example value>)." |
+| none of the above | **Unclear** | "UNKNOWN — needs a human; sample values: <…>." |
+
+Use the table's purpose (from `01_tables.md` / table comment) to fill in `<table subject>`
+and `<parent subject>`. Keep each meaning to ONE line.
+
+### Step 3 — Write it down
+
+Append to `schema/02b_business_context.md`, and copy the final sentence into the BUSINESS
+MEANING cell of that column in `02_columns.md` (replace `(infer in 2B)`).
+
+**Output template — `schema/02b_business_context.md`**
+```markdown
+## CUSTOMER
+
+| column | category | evidence (total/non_null/distinct, examples) | inferred meaning | source | confidence |
+|--------|----------|----------------------------------------------|------------------|--------|------------|
+| CUSTOMER_ID | Identifier | 8021 / 8021 / 8021; e.g. 1001,1002 | Unique identifier of a customer. | inferred | HIGH |
+| STATUS | Category | 8021 / 8021 / 3; A=6100,B=1700,C=221 | Customer status; observed values: A, B, C. | inferred | HIGH |
+| VAT_NO | Free text | 8021 / 7990 / 7990; e.g. PL1234567890 | Free-text VAT identification number. | inferred | MEDIUM |
+| LEGACY_FLD | Unclear | 8021 / 12 / 12; e.g. X9, X7 | UNKNOWN — needs a human. | inferred | LOW |
+```
+
+- **source** is `db-comment` (came from `describe` COMMENTS), `input-file` (came from
+  `tables_input.txt`), or `inferred` (you deduced it here).
+- **confidence**: HIGH when name + data + relation all agree; MEDIUM when only data hints;
+  LOW/`UNKNOWN` when unclear — flag those for a human.
+
+**Done-check:** no cell in `02_columns.md` still says `(infer in 2B)`; every column has a
+meaning or is explicitly `UNKNOWN`.
+
+---
+
+## PHASE 3 — List keys and candidate join columns
+
+**Goal:** prepare for relationship inference. No DB calls here — use `02_columns.md`.
+
+**Steps**
+
+1. For every table, write down its **PK column(s)** (from `PK = Y`).
+2. Build a list of **candidate join columns**: any column that looks like a key —
+   its name ends with one of `_ID, _NR, _NO, _KEY, _CODE, _FK`, **or** its name equals a
+   PK column name of some other table.
+3. Save a scratch table at the top of `schema/03_relations.md`:
+
+```markdown
+# Relations
+
+## Key inventory
+| TABLE | PK column(s) | Candidate join columns |
+|-------|--------------|------------------------|
+| CUSTOMER | CUSTOMER_ID | CUSTOMER_ID |
+| ORDERS   | ORDER_ID    | ORDER_ID, CUSTOMER_ID, SHIP_CITY_CODE |
+```
+
+**Rule of thumb for direction:** the table where a column is the **PK** is the *parent*
+(the "one" side). A table that holds the *same* column but **not as its PK** is the
+*child* (the "many" side, i.e. the foreign key).
+
+---
+
+## PHASE 4 — Verify relationships with data (no FK constraints exist)
+
+**Goal:** turn name guesses into evidence-backed relationships. For each candidate pair
+`CHILD.CHILD_COL  →  PARENT.PARENT_PK`, run two small probes and decide.
+
+**For ONE candidate pair at a time:**
+
+1. **Overlap probe** — how many child rows point to an existing parent row:
+   ```powershell
+   python dbtool.py query "SELECT COUNT(*) AS matched FROM CHILD c WHERE c.CHILD_COL IS NOT NULL AND EXISTS (SELECT 1 FROM PARENT p WHERE p.PARENT_PK = c.CHILD_COL)"
+   ```
+2. **Orphan probe** — how many child rows point to a *missing* parent row:
+   ```powershell
+   python dbtool.py query "SELECT COUNT(*) AS orphans FROM CHILD c WHERE c.CHILD_COL IS NOT NULL AND NOT EXISTS (SELECT 1 FROM PARENT p WHERE p.PARENT_PK = c.CHILD_COL)"
+   ```
+3. **Decide** using the rubric (Appendix C):
+   - `matched > 0` and `orphans = 0` → **CONFIRMED** relationship.
+   - `matched > 0` and `orphans` small → **LIKELY** (note the orphan count).
+   - `matched = 0` → **REJECTED** (names looked alike but data does not link).
+4. Append one row to the relationships table in `schema/03_relations.md`.
+5. Next pair.
+
+> Tip: to see what values look like before probing, sample them:
+> `python dbtool.py query "SELECT CHILD_COL FROM CHILD" --limit 10`
+
+**Output template — append under `schema/03_relations.md`**
+```markdown
+## Verified relationships
+| CHILD.column | -> | PARENT.column | cardinality | matched | orphans | confidence |
+|--------------|----|---------------|-------------|---------|---------|------------|
+| ORDERS.CUSTOMER_ID | -> | CUSTOMER.CUSTOMER_ID | many-to-one | 15230 | 0 | CONFIRMED |
+| ORDERS.SHIP_CITY_CODE | -> | CITY.CODE | many-to-one | 15230 | 12 | LIKELY |
+
+## Unresolved key-like columns (need a human)
+- ORDERS.LEGACY_REF — looks like a key, no matching parent table found.
+```
+
+**Done-check:** every candidate join column from Phase 3 is either in the verified table
+or in the "unresolved" list.
+
+---
+
+## PHASE 5 — Draw the ERD (Mermaid)
+
+**Goal:** a diagram of tables + inferred relationships. Use only **CONFIRMED** and
+**LIKELY** relationships from `03_relations.md`.
+
+**Steps**
+
+1. For each table, make a Mermaid entity listing its **PK and join columns only** (keep
+   full column lists in `02_columns.md`; the ERD stays readable). Mark PK with `PK`,
+   foreign/join columns with `FK`.
+2. For each relationship, draw the parent as the "one" side and the child as the "many"
+   side: `PARENT ||--o{ CHILD : "child_col -> parent_col"`.
+3. Write `schema/04_erd.md`.
+
+**Output template — `schema/04_erd.md`**
+```markdown
+# ERD (relationships inferred from data — no FK constraints in the DB)
+
+```mermaid
+erDiagram
+    CUSTOMER ||--o{ ORDERS : "ORDERS.CUSTOMER_ID -> CUSTOMER.CUSTOMER_ID"
+    CITY     ||--o{ ORDERS : "ORDERS.SHIP_CITY_CODE -> CITY.CODE (LIKELY)"
+
+    CUSTOMER {
+        NUMBER CUSTOMER_ID PK
+    }
+    ORDERS {
+        NUMBER ORDER_ID PK
+        NUMBER CUSTOMER_ID FK
+        VARCHAR2 SHIP_CITY_CODE FK
+    }
+    CITY {
+        VARCHAR2 CODE PK
+    }
+```
+```
+> Cardinality symbols: `||` = exactly one, `o{` = zero-or-many. Parent first, child
+> second. If unsure of optionality, `||--o{` (one-to-many) is a safe default.
+
+---
+
+## PHASE 6 — Write the schema knowledge file (what the LLM will actually use)
+
+**Goal:** one card per table that tells a future model how to query it and how to join.
+Build it from `02_columns.md` (columns) and `03_relations.md` (joins).
+
+**Output template — one card per table in `schema/05_knowledge.md`**
+```markdown
+## ORDERS
+Purpose: sales order headers (one row per order).
+Primary key: ORDER_ID
+Key columns (with business meaning, from the COMMENTS in 02_columns.md):
+- ORDER_ID — surrogate primary key of the order
+- CUSTOMER_ID — the customer who placed the order (join key to CUSTOMER)
+- ORDER_DATE — date the order was created
+- STATUS — order lifecycle status (e.g. NEW/PAID/SHIPPED)
+- TOTAL_AMOUNT — order gross total in PLN
+Full column list: see 02_columns.md#orders
+
+Relationships:
+- ORDERS.CUSTOMER_ID -> CUSTOMER.CUSTOMER_ID  (many-to-one, CONFIRMED)
+    join: FROM ORDERS o JOIN CUSTOMER c ON o.CUSTOMER_ID = c.CUSTOMER_ID
+- ORDERS.SHIP_CITY_CODE -> CITY.CODE          (many-to-one, LIKELY)
+    join: FROM ORDERS o JOIN CITY ci ON o.SHIP_CITY_CODE = ci.CODE
+
+Common query patterns:
+- Orders of one customer:
+    SELECT o.ORDER_ID, o.ORDER_DATE, o.TOTAL_AMOUNT
+    FROM ORDERS o WHERE o.CUSTOMER_ID = :cust_id
+- Orders with customer name (join):
+    SELECT o.ORDER_ID, c.NAME, o.TOTAL_AMOUNT
+    FROM ORDERS o JOIN CUSTOMER c ON o.CUSTOMER_ID = c.CUSTOMER_ID
+```
+
+**Done-check:** every FOUND table has a card. This file is the deliverable that teaches
+the schema — keep it up to date if tables change.
+
+---
+
+## Appendix A — Cross-schema fallback (table not in your schema)
+
+`tables` and `describe` only see the **current** schema (`USER_*` views). If a table
+from the input file is owned by another schema, `describe` returns empty rows. Then fetch
+columns with a direct query on `ALL_TAB_COLUMNS` (replace `OWNER_NAME` and `TABLE_NAME`):
+
+```powershell
+python dbtool.py query "SELECT column_id AS pos, column_name AS name, data_type AS type, data_length AS length, nullable FROM all_tab_columns WHERE owner = :o AND table_name = :t ORDER BY column_id" --bind o=OWNER_NAME --bind t=TABLE_NAME
+```
+
+Primary key columns for a cross-schema table:
+```powershell
+python dbtool.py query "SELECT cc.column_name FROM all_constraints uc JOIN all_cons_columns cc ON uc.constraint_name = cc.constraint_name AND uc.owner = cc.owner WHERE uc.constraint_type = 'P' AND uc.owner = :o AND uc.table_name = :t ORDER BY cc.position" --bind o=OWNER_NAME --bind t=TABLE_NAME
+```
+When querying a cross-schema table in probes, prefix it: `OWNER_NAME.TABLE_NAME`.
+
+---
+
+## Appendix B — Probe SQL cheat-sheet
+
+- **Row count / distinctness of a column** (is it an id? are values unique?):
+  ```powershell
+  python dbtool.py query "SELECT COUNT(*) AS total, COUNT(DISTINCT COL) AS distinct_vals, COUNT(COL) AS non_null FROM TAB"
+  ```
+- **Sample values** (see the format before you join):
+  ```powershell
+  python dbtool.py query "SELECT COL FROM TAB" --limit 10
+  ```
+- **Overlap probe** (matched child rows): see Phase 4 step 1.
+- **Orphan probe** (broken references): see Phase 4 step 2.
+- **Is the parent column unique** (must be, to be a real key):
+  ```powershell
+  python dbtool.py query "SELECT COUNT(*) AS total, COUNT(DISTINCT PARENT_PK) AS uniq FROM PARENT"
+  ```
+  If `total = uniq`, the column is unique and can act as a key.
+
+All probes use `COUNT` so they return a single tiny row — never `SELECT *` a whole table
+to eyeball it.
+
+---
+
+## Appendix C — Confidence rubric
+
+| matched | orphans | parent col unique? | Verdict |
+|---------|---------|--------------------|---------|
+| > 0 | 0 | yes | **CONFIRMED** |
+| > 0 | few (explainable, e.g. nulls/legacy) | yes | **LIKELY** (note count) |
+| > 0 | many | yes | **WEAK** — record but flag for review |
+| 0 | — | — | **REJECTED** — names matched, data did not |
+| > 0 | any | no | **REJECTED as key** — parent col is not unique; not a real parent |
+
+Prefer evidence over names. A column called `CUSTOMER_ID` that does not actually match
+any `CUSTOMER.CUSTOMER_ID` value is **not** a relationship.
+
+---
+
+## Quick reference — the only commands you need
+
+```powershell
+python dbtool.py ping                          # check connection
+python dbtool.py tables [--like "PAT%"]        # list tables/views
+python dbtool.py describe TABLE                 # columns + PK
+python dbtool.py query "SELECT ..."             # read-only query
+python dbtool.py query "SELECT ... :x" --bind x=VALUE   # with a bound value
+# add --format tsv for big results, --limit N to change the row cap
+```
+Remember: identifiers (table/column names) go inside the SQL text; only literal **values**
+use `--bind`.
