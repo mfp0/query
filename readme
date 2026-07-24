@@ -1,0 +1,283 @@
+# dbtool.py — Oracle query tool for LLM agents
+
+A single-file Python CLI that lets an LLM agent (e.g. **Roo Code**) query an Oracle
+database. Think of it as a headless alternative to SQL Developer: instead of a human
+clicking around, the model composes SQL and this tool runs it and returns clean JSON.
+
+- **Standard library only.** No `oracledb`, `cx_Oracle`, JDBC bridge, JPype, or any
+  PyPI package. Nothing to `pip install`. Runs on a bare Python 3.12+ interpreter.
+- **The only channel to the DB is SQLcl** (`sql.exe`, bundled with SQL Developer),
+  invoked via `subprocess`. The SQL script is fed on stdin; the result is JSON.
+- **Output is always a single JSON object on stdout**, including on error — easy for
+  a model to parse. Exit codes distinguish success / DB error / usage error / timeout.
+
+---
+
+## Requirements
+
+| Requirement | Notes |
+|-------------|-------|
+| Python 3.12+ | Standard library only. Tested on 3.12 and targeted at 3.14. |
+| SQLcl (`sql.exe`) | Ships with SQL Developer / the VS Code Oracle extension. No separate Oracle client needed (we use the **thin** JDBC driver). |
+| A reachable Oracle DB | Tested against Oracle 21c XE (services `XEPDB1` and `XE`). |
+
+No Oracle client installation is required — the tool forces the pure-JDBC **thin**
+driver, so it connects with nothing but SQLcl present.
+
+---
+
+## Quick start
+
+```powershell
+# 1. First run creates a config.ini template next to the script, then exits (code 2).
+python dbtool.py ping
+
+# 2. Edit config.ini: set host/port/service/user/pwd for your environment.
+
+# 3. Verify the connection.
+python dbtool.py ping
+# {"ok": true, "columns": ["BANNER","DB_NAME","SERVICE","CURRENT_USER"], "rows": [[...]], ...}
+```
+
+---
+
+## Configuration (`config.ini`)
+
+Created automatically on first run, in the same directory as `dbtool.py`.
+**All customization happens here — you never edit the `.py`.**
+
+```ini
+[DEFAULT]
+env = dev              ; environment used when --env is not given
+sqlcl_path =           ; path to sql.exe; empty = use SQLCL_PATH or auto-detect
+limit = 200            ; default row limit
+timeout = 60           ; subprocess timeout in seconds
+driver = thin          ; thin = pure JDBC (recommended); thick = OCI (needs client)
+
+[dev]
+host = localhost
+port = 1521
+service = XEPDB1
+user = system
+pwd = admin
+
+[prod]
+host = prod-db.company.local
+port = 1521
+service = ORCLPDB1
+user = report
+pwd = ********
+timeout = 120          ; per-environment override (inherits [DEFAULT] otherwise)
+limit = 500
+```
+
+### Values inherit from `[DEFAULT]`
+Any key set in `[DEFAULT]` (`limit`, `timeout`, `driver`, `sqlcl_path`) is inherited by
+every environment section and can be **overridden per environment** — e.g. a larger
+`timeout` for `prod`.
+
+---
+
+## Environments (multi-env)
+
+Define as many environments as you like — each is a `[section]` with its own
+host/port/service/user/pwd. **Selection order (highest priority first):**
+
+1. `--env <name>` flag
+2. `DBTOOL_ENV` environment variable
+3. `[DEFAULT] env` in `config.ini`
+
+```powershell
+python dbtool.py --env prod ping        # explicit
+$env:DBTOOL_ENV = "prod"; python dbtool.py ping   # via env var
+python dbtool.py ping                   # falls back to [DEFAULT] env
+```
+
+### Overriding credentials/DSN without editing the file
+The variables `ORA_USER`, `ORA_PWD`, `ORA_DSN` override the chosen section. Useful for
+CI or for keeping a password out of the file:
+
+```powershell
+$env:ORA_PWD = "secret"
+$env:ORA_DSN = "//localhost:1521/XE"   # bypasses host/port/service from the section
+python dbtool.py ping
+```
+
+---
+
+## Subcommands
+
+### `ping` — connection check + DB version
+```powershell
+python dbtool.py ping
+```
+```json
+{"ok": true, "columns": ["BANNER","DB_NAME","SERVICE","CURRENT_USER"],
+ "rows": [["Oracle Database 21c Express Edition ...","XEPDB1","xepdb1","SYSTEM"]],
+ "row_count": 1, "truncated": false}
+```
+
+### `query` — run a SELECT / WITH
+```powershell
+python dbtool.py query "SELECT employee_id, last_name FROM employees"
+python dbtool.py query "WITH t AS (SELECT 1 n FROM dual) SELECT n FROM t"
+```
+Read-only by default (see [Safety](#safety-model)). `WITH` (CTE, including recursive)
+is fully supported.
+
+### `tables` — list tables & views of the current schema
+```powershell
+python dbtool.py tables               # all
+python dbtool.py tables --like "EMP%" # LIKE pattern
+```
+
+### `describe` — columns, types, nullability, primary key, business comment
+```powershell
+python dbtool.py describe EMPLOYEES
+```
+```json
+{"ok": true, "columns": ["POS","NAME","TYPE","LENGTH","NULLABLE","PK","COMMENTS"],
+ "rows": [[1,"EMPLOYEE_ID","NUMBER",22,"N","Y","Surrogate primary key"], ...],
+ "row_count": 8, "truncated": false}
+```
+`COMMENTS` is the per-column business description from `USER_COL_COMMENTS` (Oracle column
+comments — the usual place enterprise schemas document what a column means). It is `null`
+when the column has no comment. This gives the model context for each column.
+
+---
+
+## Bind variables (parameters)
+
+Pass parameters with `--bind name=value` (repeatable) and reference them as `:name` in
+SQL. Values are bound via a PL/SQL block, **never concatenated** into the query — so
+they cannot break out into SQL injection.
+
+```powershell
+python dbtool.py query "SELECT * FROM emp WHERE deptno = :dno" --bind dno=10
+python dbtool.py query "SELECT :a AS a, :b AS b FROM dual" --bind a=hello --bind b=42
+```
+
+- All binds are typed `VARCHAR2(4000)`. For strict numeric/date semantics, cast in SQL:
+  `WHERE hire_date >= TO_DATE(:d,'YYYY-MM-DD')`.
+- A `}` inside a bind value is dropped (it collides with the `q'{...}'` quoting delimiter).
+
+---
+
+## Output contract
+
+**Success:**
+```json
+{"ok": true, "columns": ["A","B"], "rows": [[1,"x"]], "row_count": 1, "truncated": false}
+```
+**Error:**
+```json
+{"ok": false, "error": "SQL Error: ORA-00942: table or view does not exist",
+ "ora_code": "ORA-00942", "hint": "Table/view does not exist or no privilege ..."}
+```
+
+- **`columns`** — column names as Oracle reports them (upper-case unless the alias was
+  quoted). Present even when `row_count` is 0.
+- **`rows`** — a list of value lists (not per-row dicts) to save tokens. Order matches
+  `columns`. SQL `NULL` → JSON `null`.
+- **`truncated`** — `true` when the tool applied its own row limit and the result hit
+  it, i.e. more rows likely exist. Narrow the query or raise `--limit`.
+- Numbers use a dot decimal separator; dates/timestamps are ISO
+  (`YYYY-MM-DD HH24:MI:SS[.FF][ TZR]`); Oracle error messages are English —
+  all forced via `ALTER SESSION` regardless of the DB server locale.
+
+### `--format tsv`
+For large result sets, `--format tsv` emits a header row + tab-separated rows instead of
+JSON (`NULL` becomes an empty field). Works before or after the subcommand:
+```powershell
+python dbtool.py query "SELECT id, name FROM big_table" --limit 10000 --format tsv
+```
+
+### Exit codes
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | SQL / database error (includes `ora_code` + `hint` when available) |
+| 2 | Usage error (bad args, guard violation, missing/invalid config) |
+| 3 | Timeout (SQLcl process tree was killed) |
+
+---
+
+## Safety model
+
+- **Read-only by default.** Only `SELECT` and `WITH` are accepted. Anything else
+  (`INSERT/UPDATE/DELETE/DDL/...`) is rejected with exit 2.
+- **Single statement only.** Multiple statements in one call are blocked (a semicolon
+  inside a string literal does **not** trigger a false positive).
+- **Writes require explicit opt-in:** `--allow-write` **and** `--yes` together. Write
+  statements (DDL/DML) return no result set, so the response is a status message rather
+  than rows: `{"ok": true, "write": true, "message": "1 row inserted."}`.
+  ```powershell
+  python dbtool.py query "UPDATE emp SET sal = sal*1.1 WHERE deptno=10" --allow-write --yes
+  ```
+- **Auto row limit.** If a query has no `FETCH FIRST` / `ROWNUM` / `OFFSET`, the tool
+  appends `FETCH FIRST <limit> ROWS ONLY` (default 200, override with `--limit`). This
+  keeps a careless model query from pulling millions of rows.
+- **Timeout with tree-kill.** After `timeout` seconds the whole SQLcl process tree
+  (including the child `java.exe`) is terminated, so no orphaned query keeps running.
+- **Password handling.** Credentials come from `config.ini` / `ORA_*`. The password is
+  masked in every echo/log/error. (It is passed to `sql.exe` on argv, so it is briefly
+  visible in the process list — an accepted trade-off for an internal tool.)
+
+---
+
+## Roo Code integration
+
+Point the agent at the tool with a short instruction like this (drop into the system
+prompt / custom instructions):
+
+```
+You can query the Oracle database with a CLI tool. Run it via:
+    python C:\path\to\dbtool.py <subcommand> [args]
+Subcommands:
+  ping                         - check connection, get DB version
+  tables [--like PATTERN]      - list tables/views in the current schema
+  describe <TABLE>             - columns, types, nullability, primary key
+  query "<SQL>" [--bind k=v]   - run a SELECT/WITH (read-only)
+Rules:
+  - Output is always one JSON object on stdout. Parse it. "ok":false means it failed;
+    read "error" and "hint" and fix your SQL.
+  - Use :name bind variables with --bind name=value for any parameter; never
+    concatenate user input into SQL.
+  - Results are {columns:[...], rows:[[...]]}. rows are value-lists aligned to columns.
+  - "truncated":true means more rows exist — add filters or pass --limit.
+  - Pick an environment with --env <name> when there is more than one.
+```
+
+Exit codes let the agent branch programmatically: `0` ok, `1` DB error, `2` usage/guard,
+`3` timeout.
+
+---
+
+## Known pitfalls
+
+The same list is kept at the bottom of `dbtool.py`:
+
+1. **Missing semicolon = hang.** SQLcl waits for the rest of a statement. The tool
+   appends `;` automatically.
+2. **Banner before JSON.** SQLcl may print warnings first; the parser slices from the
+   first `{` to the last `}`.
+3. **Number locale breaks JSON.** A comma-decimal locale would emit `3,14`; the tool
+   forces `NLS_NUMERIC_CHARACTERS='.,'`.
+4. **thin vs thick driver.** This SQLcl maps the `@//host` form to the OCI/thick driver
+   (which needs an Oracle client). The tool forces `jdbc:oracle:thin:@...`. Switch to
+   `driver = thick` only if you actually have a client on PATH.
+5. **Binds are VARCHAR2.** Cast in SQL for strict numeric/date semantics.
+6. **Current schema only.** `tables`/`describe` read `USER_*` views. For other schemas,
+   log in as that user or query `ALL_TAB_COLUMNS` with an `OWNER` filter via `query`.
+7. **Encoding.** Output is UTF-8 (forced), so non-ASCII data round-trips correctly even
+   though a Windows console may render it wrong on screen.
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `dbtool.py` | The tool. Copy this to a new machine to deploy. |
+| `config.ini` | Your environments/credentials. Auto-created on first run. |
+| `README.md` | This document. |
