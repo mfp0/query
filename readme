@@ -145,6 +145,25 @@ python dbtool.py query --file cleanup.sql --allow-write --yes
 - All the usual flags still apply: `--limit`, `--format tsv`, and `--allow-write --yes`
   for a DDL/DML script.
 
+> **Shell-quoting gotcha (why a query can fail here but work in SQL Developer).**
+> When you pass SQL inline, your shell rewrites it *before* the tool sees it. In
+> **PowerShell**, a double-quoted string interpolates `$name`, so an Oracle dictionary
+> object like `v$version` or `user$` becomes `v`/`user` → `ORA-00942: table or view does
+> not exist`. Single quotes avoid `$` interpolation but then break on `'...'` string
+> literals inside your SQL. **For anything non-trivial, use `--file` — it bypasses shell
+> quoting entirely** (`$`, backticks, apostrophes all pass through untouched).
+
+#### Debugging mangled SQL with `--dry-run`
+`query --dry-run` prints the exact SQL/script the tool *would* send to SQLcl and exits
+**without touching the database**. Use it to see whether your SQL arrived intact:
+```powershell
+python dbtool.py query "SELECT COUNT(*) FROM v$version" --dry-run
+# {"ok": true, "dry_run": true, "sql": "SELECT COUNT(*) FROM v ...", ...}   <-- $version eaten by PowerShell
+python dbtool.py query --file q.sql --dry-run
+# sql/script show v$version intact
+```
+The dry-run output never contains the password.
+
 ### `tables` — list tables & views of the current schema
 ```powershell
 python dbtool.py tables               # all
@@ -294,6 +313,10 @@ The same list is kept at the bottom of `dbtool.py`:
    log in as that user or query `ALL_TAB_COLUMNS` with an `OWNER` filter via `query`.
 7. **Encoding.** Output is UTF-8 (forced), so non-ASCII data round-trips correctly even
    though a Windows console may render it wrong on screen.
+8. **Shell eats your SQL.** The shell rewrites an inline query before the tool sees it —
+   in PowerShell a double-quoted `$name` (e.g. `v$version`) is interpolated away, giving
+   a spurious `ORA-00942`. Use `--file` for anything non-trivial, and `query --dry-run`
+   to inspect exactly what text the tool received.
 
 ---
 
