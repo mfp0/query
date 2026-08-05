@@ -572,6 +572,9 @@ def cmd_query(conn, args):
 
     if write_mode:
         # DDL/DML path - no result set, no read-only guard, no auto-limit.
+        if args.dry_run:
+            emit_dry_run(conn, sql, for_write=True)
+            return
         run_write_sql(conn, sql)
         return
 
@@ -583,7 +586,22 @@ def cmd_query(conn, args):
         sql = apply_limit(sql, limit)
         applied_limit = True
 
+    if args.dry_run:
+        emit_dry_run(conn, sql, for_write=False)
+        return
+
     run_query_sql(conn, sql, args.format, limit, applied_limit)
+
+
+def emit_dry_run(conn, sql, for_write):
+    """Print the exact SQLcl script the tool WOULD run, without connecting to the
+    DB. Use it to debug 'works in SQL Developer but not here' cases: it reveals
+    whether the SQL text got mangled before reaching the tool (a classic one is a
+    PowerShell double-quoted string eating a $ in a dictionary object like V$...,
+    or apostrophes in literals). The script never contains the password."""
+    script = build_script([sql], binds=conn.get("_binds"), for_write=for_write)
+    payload = {"ok": True, "dry_run": True, "sql": sql, "script": script}
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def cmd_tables(conn, args):
@@ -657,6 +675,7 @@ def build_parser():
     sq.add_argument("--limit", type=int, help="Row limit (default: from config.ini / 200).")
     sq.add_argument("--allow-write", action="store_true", help="Allow non-SELECT (requires --yes).")
     sq.add_argument("--yes", action="store_true", help="Confirmation for --allow-write.")
+    sq.add_argument("--dry-run", action="store_true", help="Print the exact SQL/script the tool would send (no DB call). Use to debug mangled SQL, e.g. shell quoting.")
     sq.set_defaults(func=cmd_query)
 
     st = sub.add_parser("tables", parents=[common], help="List tables and views of the current schema.")
@@ -724,3 +743,8 @@ if __name__ == "__main__":
 #    ALL_TAB_COLUMNS with an OWNER filter.
 # 9. Timeout kills the tree. sql.exe spawns java.exe; on timeout we taskkill /T
 #    the whole tree so no orphaned query keeps running.
+# 10. Shell mangles inline SQL. The shell rewrites the query BEFORE argparse sees
+#     it. In PowerShell a double-quoted "$name" is interpolated, so v$version ->
+#     v (spurious ORA-00942). Single quotes stop $ but break on '...' literals.
+#     Use --file for non-trivial SQL (bypasses shell quoting); use query --dry-run
+#     to print the exact text the tool received without hitting the DB.
