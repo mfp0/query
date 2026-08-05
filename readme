@@ -125,6 +125,26 @@ python dbtool.py query "WITH t AS (SELECT 1 n FROM dual) SELECT n FROM t"
 Read-only by default (see [Safety](#safety-model)). `WITH` (CTE, including recursive)
 is fully supported.
 
+#### Running SQL from a file (`--file` / `-f`)
+Instead of passing the SQL text as an argument, point the tool at a `.sql` file. This
+is the reliable way to run **long queries** (hundreds/thousands of lines): the model
+references the file by path rather than retyping the SQL, which removes a whole class
+of transcription errors.
+
+```powershell
+python dbtool.py query --file report.sql
+python dbtool.py query -f report.sql --bind dno=10 --bind from_date=2026-01-01
+python dbtool.py query --file cleanup.sql --allow-write --yes
+```
+
+- Provide **either** the positional SQL **or** `--file`, never both.
+- Bind parameters work exactly as with inline SQL: put `:name` placeholders in the file
+  and supply values with `--bind name=value`. The file is **never** rewritten.
+- The file is read as UTF-8 (a leading BOM is stripped automatically). A trailing `;`
+  is fine; the same single-statement / read-only guards apply as for inline SQL.
+- All the usual flags still apply: `--limit`, `--format tsv`, and `--allow-write --yes`
+  for a DDL/DML script.
+
 ### `tables` — list tables & views of the current schema
 ```powershell
 python dbtool.py tables               # all
@@ -238,7 +258,10 @@ Subcommands:
   tables [--like PATTERN]      - list tables/views in the current schema
   describe <TABLE>             - columns, types, nullability, primary key
   query "<SQL>" [--bind k=v]   - run a SELECT/WITH (read-only)
+  query --file PATH [--bind k=v] - run SQL read from a file (use for long queries)
 Rules:
+  - For long SQL, save it to a .sql file and run `query --file PATH` instead of pasting
+    the whole query as an argument. Keep :name placeholders in the file; pass --bind.
   - Output is always one JSON object on stdout. Parse it. "ok":false means it failed;
     read "error" and "hint" and fix your SQL.
   - Use :name bind variables with --bind name=value for any parameter; never
