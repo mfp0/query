@@ -125,6 +125,45 @@ python dbtool.py query "WITH t AS (SELECT 1 n FROM dual) SELECT n FROM t"
 Read-only by default (see [Safety](#safety-model)). `WITH` (CTE, including recursive)
 is fully supported.
 
+#### Running SQL from a file (`--file` / `-f`)
+Instead of passing the SQL text as an argument, point the tool at a `.sql` file. This
+is the reliable way to run **long queries** (hundreds/thousands of lines): the model
+references the file by path rather than retyping the SQL, which removes a whole class
+of transcription errors.
+
+```powershell
+python dbtool.py query --file report.sql
+python dbtool.py query -f report.sql --bind dno=10 --bind from_date=2026-01-01
+python dbtool.py query --file cleanup.sql --allow-write --yes
+```
+
+- Provide **either** the positional SQL **or** `--file`, never both.
+- Bind parameters work exactly as with inline SQL: put `:name` placeholders in the file
+  and supply values with `--bind name=value`. The file is **never** rewritten.
+- The file is read as UTF-8 (a leading BOM is stripped automatically). A trailing `;`
+  is fine; the same single-statement / read-only guards apply as for inline SQL.
+- All the usual flags still apply: `--limit`, `--format tsv`, and `--allow-write --yes`
+  for a DDL/DML script.
+
+> **Shell-quoting gotcha (why a query can fail here but work in SQL Developer).**
+> When you pass SQL inline, your shell rewrites it *before* the tool sees it. In
+> **PowerShell**, a double-quoted string interpolates `$name`, so an Oracle dictionary
+> object like `v$version` or `user$` becomes `v`/`user` → `ORA-00942: table or view does
+> not exist`. Single quotes avoid `$` interpolation but then break on `'...'` string
+> literals inside your SQL. **For anything non-trivial, use `--file` — it bypasses shell
+> quoting entirely** (`$`, backticks, apostrophes all pass through untouched).
+
+#### Debugging mangled SQL with `--dry-run`
+`query --dry-run` prints the exact SQL/script the tool *would* send to SQLcl and exits
+**without touching the database**. Use it to see whether your SQL arrived intact:
+```powershell
+python dbtool.py query "SELECT COUNT(*) FROM v$version" --dry-run
+# {"ok": true, "dry_run": true, "sql": "SELECT COUNT(*) FROM v ...", ...}   <-- $version eaten by PowerShell
+python dbtool.py query --file q.sql --dry-run
+# sql/script show v$version intact
+```
+The dry-run output never contains the password.
+
 ### `tables` — list tables & views of the current schema
 ```powershell
 python dbtool.py tables               # all
@@ -160,6 +199,13 @@ python dbtool.py query "SELECT :a AS a, :b AS b FROM dual" --bind a=hello --bind
 - All binds are typed `VARCHAR2(4000)`. For strict numeric/date semantics, cast in SQL:
   `WHERE hire_date >= TO_DATE(:d,'YYYY-MM-DD')`.
 - A `}` inside a bind value is dropped (it collides with the `q'{...}'` quoting delimiter).
+- **Forgotten bind is caught up front.** If the SQL references `:name` with no matching
+  `--bind name=value`, the tool fails fast (exit 2) with the missing name(s) listed,
+  instead of the confusing empty result SQLcl gives for an undeclared bind. This is the
+  common failure mode with many binds. (A `:` inside a string literal or comment is not
+  mistaken for a bind.)
+- Bind *values* may safely contain apostrophes, `&`, `$`, spaces and colons — they are
+  bound via PL/SQL and never re-parsed by the shell or by SQLcl substitution.
 
 ---
 
@@ -237,14 +283,35 @@ Subcommands:
   ping                         - check connection, get DB version
   tables [--like PATTERN]      - list tables/views in the current schema
   describe <TABLE>             - columns, types, nullability, primary key
-  query "<SQL>" [--bind k=v]   - run a SELECT/WITH (read-only)
-Rules:
-  - Output is always one JSON object on stdout. Parse it. "ok":false means it failed;
-    read "error" and "hint" and fix your SQL.
-  - Use :name bind variables with --bind name=value for any parameter; never
-    concatenate user input into SQL.
+  query "<SQL>" [--bind k=v]   - run a short SELECT/WITH (read-only)
+  query --file PATH [--bind k=v] - run SQL read from a file (the safe default)
+
+DECIDE FIRST: file or inline?
+  - DEFAULT TO --file. Write the exact SQL into a .sql file (e.g. q.sql), then run:
+        python dbtool.py query --file q.sql --bind name=value
+    You MUST use --file when the SQL is longer than one line, or contains ANY of:
+    an apostrophe ' , a double quote " , a dollar sign $ (e.g. v$version), an
+    ampersand & , or a semicolon. The shell corrupts these characters inline.
+  - Inline (query "<SQL>") is allowed ONLY for a short single-line query with none
+    of those characters. Wrap it in double quotes.
+  - NEVER pass a file path as the SQL argument. Files go through --file PATH.
+  - NEVER retype or reformat an existing long query - save it to a file unchanged
+    and run it with --file.
+
+Bind rules:
+  - Any literal value you compare against goes through a bind: put :name in the SQL
+    and pass --bind name=value. One --bind per name. The name after --bind has NO
+    colon: `--bind dno=10`, not `--bind :dno=10`.
+  - Table and column names can NOT be bound - they go directly in the SQL text.
+  - Binds are text; for strict types cast in SQL: TO_NUMBER(:x), TO_DATE(:d,'YYYY-MM-DD').
+
+Reading results:
+  - Output is always one JSON object on stdout. "ok":false means it failed: read
+    "error" and "hint", fix the SQL, retry ONCE. If it fails again the same way,
+    run the same query with --dry-run and check whether the "sql" field matches
+    what you intended; if it does not, switch to --file.
   - Results are {columns:[...], rows:[[...]]}. rows are value-lists aligned to columns.
-  - "truncated":true means more rows exist — add filters or pass --limit.
+  - "truncated":true means more rows exist - add filters or pass --limit.
   - Pick an environment with --env <name> when there is more than one.
 ```
 
@@ -271,6 +338,19 @@ The same list is kept at the bottom of `dbtool.py`:
    log in as that user or query `ALL_TAB_COLUMNS` with an `OWNER` filter via `query`.
 7. **Encoding.** Output is UTF-8 (forced), so non-ASCII data round-trips correctly even
    though a Windows console may render it wrong on screen.
+8. **Shell eats your SQL.** The shell rewrites an inline query before the tool sees it —
+   in PowerShell a double-quoted `$name` (e.g. `v$version`) is interpolated away, giving
+   a spurious `ORA-00942`. Use `--file` for anything non-trivial, and `query --dry-run`
+   to inspect exactly what text the tool received.
+9. **SQLcl script-mode gotchas (handled).** Feeding SQL as a script exposes SQL\*Plus
+   defaults that SQL Developer hides — these used to make a long query fail here while
+   working in the IDE. The tool now sets them for every run:
+   - `SET DEFINE OFF` / `SET SCAN OFF` — an `&` in a literal/comment is NOT treated as a
+     substitution variable (otherwise SQLcl aborts with "Substitution cancelled").
+   - `SET SQLBLANKLINES ON` — blank lines inside a statement are allowed (otherwise a
+     blank line between clauses truncates a long, formatted query).
+   - `SET LONG 1000000` — CLOB/LONG columns return up to 1 MB instead of the 80-char
+     default truncation.
 
 ---
 
