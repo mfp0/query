@@ -25,6 +25,7 @@ EXAMPLES (for the agent):
     python dbtool.py describe EMPLOYEES
     python dbtool.py query "SELECT employee_id, last_name FROM employees"
     python dbtool.py query "SELECT * FROM emp WHERE deptno = :dno" --bind dno=10
+    python dbtool.py query --file big_report.sql --bind dno=10
     python dbtool.py --env prod query "SELECT sysdate FROM dual" --format tsv
 """
 
@@ -525,8 +526,38 @@ def cmd_ping(conn, args):
     emit_success(columns, rows, False, args.format)
 
 
+def read_query_sql(args):
+    """Resolve the SQL text for `query`: either the positional argument or the
+    contents of --file. Reading from a file avoids having the model retype long
+    (1000+ line) queries, which is a frequent source of transcription errors."""
+    if args.file:
+        if args.sql:
+            raise ToolError(
+                "Pass the SQL either as an argument or with --file, not both.",
+                exit_code=2,
+            )
+        if not os.path.isfile(args.file):
+            raise ToolError("SQL file not found: {}".format(args.file), exit_code=2)
+        try:
+            # utf-8-sig transparently strips a BOM (common on Windows-saved .sql).
+            with open(args.file, "r", encoding="utf-8-sig") as f:
+                sql = f.read()
+        except OSError as e:
+            raise ToolError(
+                "Cannot read SQL file {}: {}".format(args.file, e), exit_code=2
+            )
+        if not sql.strip():
+            raise ToolError("SQL file is empty: {}".format(args.file), exit_code=2)
+        return sql
+    if not args.sql:
+        raise ToolError(
+            "Provide the SQL as an argument or with --file PATH.", exit_code=2
+        )
+    return args.sql
+
+
 def cmd_query(conn, args):
-    sql = args.sql
+    sql = read_query_sql(args)
     binds = {}
     for item in args.bind or []:
         if "=" not in item:
@@ -620,7 +651,8 @@ def build_parser():
     sp.set_defaults(func=cmd_ping)
 
     sq = sub.add_parser("query", parents=[common], help="Run a SELECT/WITH (read-only by default).")
-    sq.add_argument("sql", help="Query text. Use :name binds instead of string concatenation.")
+    sq.add_argument("sql", nargs="?", help="Query text. Use :name binds instead of string concatenation. Omit when using --file.")
+    sq.add_argument("--file", "-f", metavar="PATH", help="Read the SQL from a file instead of the argument (handy for long queries). Binds still come from --bind.")
     sq.add_argument("--bind", action="append", metavar="NAME=VALUE", help="Value for the :NAME bind. Repeatable.")
     sq.add_argument("--limit", type=int, help="Row limit (default: from config.ini / 200).")
     sq.add_argument("--allow-write", action="store_true", help="Allow non-SELECT (requires --yes).")
