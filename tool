@@ -748,3 +748,4 @@ if __name__ == "__main__":
 #     v (spurious ORA-00942). Single quotes stop $ but break on '...' literals.
 #     Use --file for non-trivial SQL (bypasses shell quoting); use query --dry-run
 #     to print the exact text the tool received without hitting the DB.
+#
