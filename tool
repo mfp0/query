@@ -53,10 +53,17 @@ ORA_HINTS = {
     "ORA-12505": "Listener does not know this SID/service - check 'service' in config.ini.",
     "ORA-01017": "Invalid username/password - fix user/pwd in the environment section of config.ini.",
     "ORA-28000": "Account is locked - unlock the user in the database.",
-    "ORA-00942": "Table/view does not exist or no privilege - check the name and schema.",
+    "ORA-00942": "Table/view does not exist or no privilege - check the name and schema. "
+                 "If the SQL was passed inline and the name contains $ (e.g. v$version), "
+                 "PowerShell ate it - save the SQL to a file and use --file, or inspect "
+                 "with --dry-run.",
     "ORA-00904": "Invalid column name - check the column names in your query.",
     "ORA-00933": "SQL command not properly ended - check the syntax.",
     "ORA-01031": "Insufficient privileges for this operation.",
+    "ORA-01008": "Not all variables bound - a :name in the SQL has no value. Pass "
+                 "--bind name=value for every :name.",
+    "ORA-01722": "Invalid number - bind values are text; cast explicitly, e.g. "
+                 "TO_NUMBER(:x), or check the value.",
 }
 
 CONFIG_TEMPLATE = """\
@@ -214,6 +221,24 @@ def build_script(body_statements, binds=None, for_write=False):
         "SET FEEDBACK OFF",
         "SET ENCODING UTF-8",
         "SET PAGESIZE 0",
+        # CRITICAL for real-world queries fed as a script (these SQL*Plus/SQLcl
+        # defaults are what make a query "work in SQL Developer but fail here"):
+        #   DEFINE OFF     - do NOT treat '&' as a substitution variable. Without
+        #                    this, an '&' in a string literal or comment makes SQLcl
+        #                    try to prompt for a value, get EOF on stdin, and abort
+        #                    with "Substitution cancelled".
+        #   SQLBLANKLINES ON - allow blank lines INSIDE a statement. Off (default),
+        #                    a blank line between clauses ends the statement early,
+        #                    truncating long formatted queries.
+        #   SCAN OFF       - belt-and-suspenders alias, also disables substitution.
+        #   LONG 1000000   - return CLOB/LONG text up to 1 MB instead of the
+        #                    80-char default truncation. (Do NOT go too high:
+        #                    SQLcl prints a "LONG setting may cause Java memory
+        #                    problems" warning that pollutes stdout.)
+        "SET DEFINE OFF",
+        "SET SCAN OFF",
+        "SET SQLBLANKLINES ON",
+        "SET LONG 1000000",
         # English Oracle error messages regardless of the server locale.
         "ALTER SESSION SET NLS_LANGUAGE = 'AMERICAN';",
         # CRITICAL: with a comma-decimal locale the number 3.14 serializes as
@@ -242,8 +267,20 @@ def build_script(body_statements, binds=None, for_write=False):
 
     for stmt in body_statements:
         s = stmt.strip()
-        if not s.endswith(";"):
-            s += ";"
+        # First real keyword (comments stripped) decides the terminator: PL/SQL
+        # blocks need '/' on its own line, plain SQL needs ';'. Both go on a NEW
+        # line - appended inline they would be swallowed by a trailing '--'
+        # comment, leaving the statement unterminated and SQLcl hanging until
+        # the timeout kills it.
+        head = strip_sql_comments(s).strip().split(None, 1)
+        kw = head[0].upper() if head else ""
+        if kw in ("BEGIN", "DECLARE"):
+            if not re.search(r"/\s*$", s):
+                if not s.endswith(";"):
+                    s += ";"
+                s += "\n/"
+        elif not s.endswith(";"):
+            s += "\n;"
         lines.append(s)
 
     lines.append("EXIT;")
@@ -446,9 +483,11 @@ def has_own_limit(sql):
 
 
 def apply_limit(sql, limit):
-    """Append FETCH FIRST n ROWS ONLY when the query has no limit of its own."""
+    """Append FETCH FIRST n ROWS ONLY when the query has no limit of its own.
+    On a NEW line: appended inline it would be swallowed when the query ends
+    with a '--' line comment (frequent in LLM- and file-sourced SQL)."""
     body = sql.strip().rstrip(";").rstrip()
-    return "{} FETCH FIRST {} ROWS ONLY".format(body, limit)
+    return "{}\nFETCH FIRST {} ROWS ONLY".format(body, limit)
 
 
 # -- Output formatting --------------------------------------------------------
@@ -553,7 +592,32 @@ def read_query_sql(args):
         raise ToolError(
             "Provide the SQL as an argument or with --file PATH.", exit_code=2
         )
+    # A .sql path passed as the positional argument (a frequent agent mistake:
+    # `query report.sql` instead of `query --file report.sql`) - handle it as
+    # --file instead of failing with a confusing "only SELECT/WITH" error.
+    cand = args.sql.strip().strip('"').strip("'")
+    if re.match(r"^[^\r\n;]+\.sql$", cand, re.IGNORECASE):
+        if os.path.isfile(cand):
+            args.file = cand
+            args.sql = None
+            return read_query_sql(args)
+        raise ToolError(
+            "'{}' looks like a SQL file path but the file does not exist. "
+            "Use: query --file PATH (with a valid path) or pass the SQL text "
+            "itself as the argument.".format(cand),
+            exit_code=2,
+        )
     return args.sql
+
+
+def find_bind_refs(sql):
+    """Return the set of :name bind references in the SQL, with comments and string
+    literals removed first (so a ':' inside data or a comment is ignored). Used to
+    catch a forgotten --bind up front with a clear message, instead of the confusing
+    empty result SQLcl gives for an undeclared bind. ':=' is not matched (the char
+    after ':' is not a word char), so PL/SQL assignments never look like binds."""
+    clean = strip_string_literals(strip_sql_comments(sql))
+    return set(re.findall(r":(\w+)", clean))
 
 
 def cmd_query(conn, args):
@@ -563,7 +627,18 @@ def cmd_query(conn, args):
         if "=" not in item:
             raise ToolError("Bad --bind format (expected name=value): {}".format(item), exit_code=2)
         name, value = item.split("=", 1)
-        binds[name.strip()] = value
+        # Forgive the ':' prefix (`--bind :dno=10`) - the models add it because
+        # the SQL placeholder is written :dno. Then validate: the name becomes a
+        # SQLcl VARIABLE, and a bad one dies inside the script with a cryptic
+        # SQLcl message instead of a clear one here.
+        name = name.strip().lstrip(":").strip()
+        if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", name):
+            raise ToolError(
+                "Bad bind name '{}' - use letters/digits/underscore starting "
+                "with a letter, e.g. --bind dno=10 (no ':' prefix).".format(name),
+                exit_code=2,
+            )
+        binds[name] = value
     conn["_binds"] = binds or None
 
     write_mode = args.allow_write
@@ -579,6 +654,35 @@ def cmd_query(conn, args):
         return
 
     enforce_readonly(sql)
+
+    # &name is SQL*Plus substitution, not a bind - with SET DEFINE OFF it would
+    # go to the DB literally and die as ORA-00904/00942. Catch it up front.
+    clean_body = strip_string_literals(strip_sql_comments(sql))
+    amp = sorted(set(re.findall(r"&&?(\w+)", clean_body)))
+    if amp:
+        raise ToolError(
+            "SQL uses &-substitution ({}) which is not supported. Use :name "
+            "placeholders with --bind name=value instead.".format(
+                ", ".join("&" + a for a in amp)
+            ),
+            exit_code=2,
+        )
+
+    # Catch a forgotten bind before hitting the DB (the common failure with many
+    # binds). Only on the read path: PL/SQL write blocks may use :new/:old.
+    referenced = find_bind_refs(sql)
+    provided = {n.lower() for n in binds}
+    missing = sorted(n for n in referenced if n.lower() not in provided)
+    if missing:
+        raise ToolError(
+            "SQL references bind(s) with no --bind value: {}. Provided: {}. "
+            "Add --bind {}=<value> (repeat per bind).".format(
+                ", ".join(":" + m for m in missing),
+                ", ".join(sorted(binds)) or "(none)",
+                missing[0],
+            ),
+            exit_code=2,
+        )
 
     limit = args.limit if args.limit is not None else conn["limit"]
     applied_limit = False
@@ -748,4 +852,10 @@ if __name__ == "__main__":
 #     v (spurious ORA-00942). Single quotes stop $ but break on '...' literals.
 #     Use --file for non-trivial SQL (bypasses shell quoting); use query --dry-run
 #     to print the exact text the tool received without hitting the DB.
-#
+# 11. SQLcl script-mode defaults (now handled in build_script). Feeding SQL on
+#     stdin exposes SQL*Plus behaviour the IDE hides: '&' as a substitution var
+#     (SET DEFINE OFF / SCAN OFF), blank lines ending a statement early
+#     (SET SQLBLANKLINES ON), and CLOB/LONG truncated to 80 chars (SET LONG). These
+#     are why a long query could work in SQL Developer yet fail here.
+# 12. Forgotten bind. A :name in the SELECT with no --bind is rejected up front
+#     (clear message) instead of SQLcl returning an empty/confusing result.
